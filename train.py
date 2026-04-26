@@ -120,7 +120,7 @@ def train_from_arrays(
     batch_size: int = 16,
     n_epochs: int = 30,
     lr: float = 8.4e-5,
-    n_windows_per_epoch: int = 512,
+    n_windows_per_epoch: int = 2048,
     device: str = "cpu",
     seed: int = 0,
     verbose: bool = True,

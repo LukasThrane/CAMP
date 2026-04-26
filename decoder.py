@@ -38,7 +38,7 @@ class EncoderBlock(nn.Module):
     """Conv → LN → GELU → Dropout → MaxPool. Returns (skip, pooled)."""
     def __init__(self, in_ch: int, out_ch: int, dropout: float = 0.1):
         super().__init__()
-        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size=3, padding=1)
+        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size=5, padding=2)
         self.norm = ChannelLayerNorm(out_ch)
         self.act = nn.GELU()
         self.drop = nn.Dropout(dropout)
