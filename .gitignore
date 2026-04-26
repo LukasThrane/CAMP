@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+
+# Local caches / large artifacts (keep out of git)
+cache/
+checkpoints/
+preprocessed/
+results/
+models/
+
+# Logs / plots
+logs/
+plots/
+
+# Jupyter
+.ipynb_checkpoints/
