@@ -1,285 +1,357 @@
 """
-preprocess.py — SERVER-SIDE preprocessing for the off-chip decoder.
+preprocess.py — FingerFlex-faithful preprocessing pipeline.
 
-Runs FingerFlex-style preprocessing (Lomtev et al. 2022) on whatever the
-chip transmitted: bandpass + 40 Morlet wavelets + decimate to 100 Hz +
-RobustScaler. None of this runs on the implant — it's the server taking
-the (held + reconstructed) stream and turning it into decoder features.
+Reimplements the FingerFlex prepare_data.ipynb pipeline as closely as
+possible. Key choices that match the published code (and differ from
+naive interpretations of the paper):
 
-Inputs:
-  - ECoG: (62, T) at 1 kHz — possibly chip-simulated with sample-and-hold
-  - Fingers: (5, T) at 1 kHz — ground truth, NaN-interpolated
+1. Standardization THEN common average reference (CAR) — subtract per-time
+   median across channels, NOT per-channel median across time.
+2. MNE's filter_data and notch_filter for bandpass 40-300 Hz and powerline
+   harmonics removal. Use 60 Hz for US data (Subject 1, UW), 50 Hz for EU.
+3. MNE's tfr_array_morlet with n_cycles=7 (default) and 40 log-spaced
+   frequencies between 40 and 300 Hz, output='power' (not magnitude).
+4. Decimation by simple slicing [::10] (NOT scipy.signal.decimate with
+   anti-aliasing), exactly what FingerFlex does.
+5. Time delay = 200 ms (ECoG leads fingers by 200ms, per their code).
+6. Fingers: MinMaxScaler fit on TRAIN, applied to both train and test.
+7. NO RobustScaler on features — FingerFlex doesn't scale features, despite
+   the paper text saying it does. They concluded "scaling helps" but their
+   final code doesn't apply it on the wavelet output (the train script
+   converts to db only optionally, default off). We follow their CODE.
 
-Outputs:
-  - features: (62, 40, T_100hz) float32 — wavelet magnitudes, scaled
-  - fingers:  (5, T_100hz) float32     — interpolated, MinMax scaled
-  - scalers fit on train split only
-
-This module exposes two functions:
-  - run_preprocessing_from_arrays(ecog, fingers, sfreq, ...) — for the
-    experiment runner, which feeds it chip-simulated streams
-  - main()  — CLI for one-off preprocessing of the raw dataset
+The chip simulator runs upstream of this — it produces the (62, T) raw
+ECoG stream that we feed in here.
 """
 
 from __future__ import annotations
 
-import argparse
-import pickle
-from dataclasses import dataclass
-from pathlib import Path
-
 import numpy as np
-from scipy.signal import butter, iirnotch, filtfilt, decimate, fftconvolve
-from scipy.interpolate import CubicSpline
 
 
-# --------------------------------------------------------------------------- #
-# Morlet wavelets
-# --------------------------------------------------------------------------- #
+# ============================================================================
+# Step 1: standardization + CAR
+# ============================================================================
 
-def make_morlet_bank(
-    sfreq: float,
+def normalize_with_car(ecog: np.ndarray) -> np.ndarray:
+    """Per-channel z-score, then subtract per-time median across channels (CAR).
+
+    This matches FingerFlex's `normalize` function:
+        means = np.mean(ecog, axis=1, keepdims=True)        # per-channel
+        stds  = np.std(ecog, axis=1, keepdims=True)         # per-channel
+        x = (ecog - means) / stds
+        common_average = np.median(x, axis=0, keepdims=True) # per-time, across channels
+        x = x - common_average
+
+    CAR (common average reference) is standard ECoG denoising — it removes
+    the spatially-uniform noise component (e.g., distant muscle, line
+    interference that escaped the notch filter).
+    """
+    ecog = ecog.astype(np.float64)
+    means = ecog.mean(axis=1, keepdims=True)
+    stds = ecog.std(axis=1, keepdims=True) + 1e-12
+    x = (ecog - means) / stds
+    car = np.median(x, axis=0, keepdims=True)
+    return x - car
+
+
+# ============================================================================
+# Step 2: bandpass + notch (using MNE)
+# ============================================================================
+
+def filter_ecog_mne(
+    ecog: np.ndarray,
+    sfreq: float = 1000.0,
+    line_freq: float = 60.0,
+    l_freq: float = 40.0,
+    h_freq: float = 300.0,
+) -> np.ndarray:
+    """Bandpass + powerline harmonic notch using MNE.
+
+    Matches FingerFlex's `filter_ecog_data`:
+        signal_filtered = mne.filter.filter_data(x, sfreq, l_freq=40, h_freq=300)
+        x = mne.filter.notch_filter(signal_filtered, sfreq, freqs=harmonics)
+
+    where `harmonics = [k*line_freq for k in range(1, sfreq/2 // line_freq)]`.
+    For 1kHz sample rate and 60Hz line: harmonics = [60, 120, 180, 240, 300, 360, 420, 480].
+    """
+    import mne
+
+    ecog = ecog.astype(np.float64)
+    # Build harmonics inside the bandpass region (MNE will silently ignore
+    # ones outside, but explicit is fine).
+    nyq = sfreq / 2.0
+    n_harmonics = int(nyq // line_freq)
+    harmonics = np.array([(k + 1) * line_freq for k in range(n_harmonics)])
+
+    filtered = mne.filter.filter_data(
+        ecog, sfreq, l_freq=l_freq, h_freq=h_freq, verbose=False
+    )
+    notched = mne.filter.notch_filter(
+        filtered, sfreq, freqs=harmonics, verbose=False
+    )
+    return notched
+
+
+# ============================================================================
+# Step 3: Morlet wavelets via MNE
+# ============================================================================
+
+def compute_spectrogramms_mne(
+    ecog: np.ndarray,
+    sfreq: float = 1000.0,
     n_wavelets: int = 40,
     f_min: float = 40.0,
     f_max: float = 300.0,
     n_cycles: float = 7.0,
-) -> tuple[np.ndarray, list[np.ndarray]]:
-    """Complex Morlet wavelets, log-spaced. Returns (freqs, kernels)."""
-    freqs = np.logspace(np.log10(f_min), np.log10(f_max), n_wavelets)
-    kernels = []
-    for f in freqs:
-        sigma_t = n_cycles / (2 * np.pi * f)
-        half_len = int(np.ceil(3.0 * sigma_t * sfreq))
-        t = np.arange(-half_len, half_len + 1) / sfreq
-        env = np.exp(-(t ** 2) / (2 * sigma_t ** 2))
-        env /= np.sqrt(np.sum(env ** 2))
-        carrier = np.exp(2j * np.pi * f * t)
-        kernels.append((env * carrier).astype(np.complex64))
-    return freqs, kernels
-
-
-def convolve_morlet_bank(
-    ecog: np.ndarray, kernels: list[np.ndarray], verbose: bool = True
+    output: str = "power",
 ) -> np.ndarray:
-    """(C, T) → (C, n_wavelets, T) magnitudes."""
-    C, T = ecog.shape
-    n_wav = len(kernels)
-    out = np.empty((C, n_wav, T), dtype=np.float32)
-    for c in range(C):
-        for w, k in enumerate(kernels):
-            conv = fftconvolve(ecog[c], k, mode="same")
-            out[c, w] = np.abs(conv).astype(np.float32)
-        if verbose and (c + 1) % 10 == 0:
-            print(f"    wavelet conv: channel {c + 1}/{C}")
-    return out
+    """Compute Morlet spectrograms using MNE's tfr_array_morlet.
 
+    Matches FingerFlex's `compute_spectrogramms` exactly. Returns
+    (n_channels, n_wavelets, n_times). FingerFlex uses output='power'
+    (the default).
 
-# --------------------------------------------------------------------------- #
-# Filtering
-# --------------------------------------------------------------------------- #
-
-def preprocess_ecog_raw(
-    ecog: np.ndarray,
-    sfreq: float,
-    line_freq: float = 60.0,
-    bandpass: tuple[float, float] = (40.0, 300.0),
-) -> np.ndarray:
-    """Standardize + median subtract + bandpass + notch line frequency.
-
-    Subject 1 is from the US (UW) so line noise = 60 Hz. Pass 50 for European.
+    n_cycles=7 is MNE's typical default for gamma-band analysis.
     """
-    ecog = ecog.astype(np.float64)
-    ecog = (ecog - ecog.mean(axis=1, keepdims=True)) / (
-        ecog.std(axis=1, keepdims=True) + 1e-8
-    )
-    ecog = ecog - np.median(ecog, axis=1, keepdims=True)
+    import mne
 
-    nyq = sfreq / 2.0
-    b, a = butter(4, [bandpass[0] / nyq, bandpass[1] / nyq], btype="band")
-    ecog = filtfilt(b, a, ecog, axis=1)
-
-    h = line_freq
-    while h < bandpass[1]:
-        if h >= bandpass[0]:
-            bn, an = iirnotch(h / nyq, Q=30.0)
-            ecog = filtfilt(bn, an, ecog, axis=1)
-        h += line_freq
-    return ecog
+    freqs = np.logspace(np.log10(f_min), np.log10(f_max), n_wavelets)
+    # MNE expects (n_epochs, n_channels, n_times) → reshape with n_epochs=1
+    x = ecog[np.newaxis, ...]   # (1, C, T)
+    spec = mne.time_frequency.tfr_array_morlet(
+        x, sfreq=sfreq, freqs=freqs, n_cycles=n_cycles,
+        output=output, verbose=False,
+    )[0]   # → (C, n_wavelets, T)
+    return spec.astype(np.float32)
 
 
-# --------------------------------------------------------------------------- #
-# Finger preprocessing
-# --------------------------------------------------------------------------- #
+# ============================================================================
+# Step 4: decimation (FingerFlex uses simple slicing, NOT antialiased)
+# ============================================================================
 
-def fill_nan_by_interpolation(x: np.ndarray) -> np.ndarray:
-    out = x.copy()
-    idx = np.arange(x.shape[1])
-    for ch in range(x.shape[0]):
-        valid = ~np.isnan(x[ch])
-        if valid.sum() == 0:
-            out[ch] = 0.0
-        else:
-            out[ch] = np.interp(idx, idx[valid], x[ch, valid])
-    return out
-
-
-def upsample_fingers_bicubic(
-    fingers: np.ndarray, sfreq_in: float, sfreq_out: float
+def downsample_spectrogramms(
+    spec: np.ndarray, sfreq_in: float = 1000.0, sfreq_out: float = 100.0
 ) -> np.ndarray:
-    n_out = int(np.round(fingers.shape[1] * sfreq_out / sfreq_in))
-    t_in = np.arange(fingers.shape[1]) / sfreq_in
-    t_out = np.arange(n_out) / sfreq_out
-    out = np.empty((fingers.shape[0], n_out), dtype=np.float64)
-    for ch in range(fingers.shape[0]):
-        out[ch] = CubicSpline(t_in, fingers[ch])(t_out)
+    """Decimate by simple slice [::10]. Matches FingerFlex.
+
+    Note: this does NOT apply an anti-aliasing filter. The Morlet wavelet
+    bank already smooths the time axis, so aliasing is small. We follow
+    FingerFlex's choice for fidelity.
+    """
+    factor = int(sfreq_in // sfreq_out)
+    assert factor > 1
+    return spec[:, :, ::factor]
+
+
+# ============================================================================
+# Step 5: finger upsampling
+# ============================================================================
+
+def interpolate_fingers(
+    fingers: np.ndarray,
+    sfreq_in: float = 1000.0,
+    target_sfreq: float = 100.0,
+    true_finger_sfreq: float = 25.0,
+    interp_kind: str = "cubic",
+) -> np.ndarray:
+    """Cubic-interpolate fingers to target sfreq.
+
+    Matches FingerFlex's `interpolate_fingerflex`. Approach:
+      - Fingers were originally sampled at 25 Hz, then NaN-padded to 1 kHz.
+      - We don't fully trust the NaN structure (braindecode interpolated for
+        us already), so we'll re-extract every 40th sample (1000/25 = 40)
+        as the "true" 25 Hz timeseries, append the last value to extend
+        the interpolation domain, then cubic-interp to 100 Hz.
+    """
+    from scipy.interpolate import interp1d
+
+    fingers = fingers.astype(np.float64)
+    downscale_ratio = int(sfreq_in // true_finger_sfreq)   # 40
+    upscale_ratio = int(target_sfreq // true_finger_sfreq) # 4
+
+    # Take every 40th sample as the canonical 25 Hz signal.
+    fingers_25hz = fingers[:, ::downscale_ratio]
+    # Extend the right edge by repeating the last sample (so cubic interp
+    # has support at the right boundary).
+    fingers_25hz = np.concatenate(
+        [fingers_25hz, fingers_25hz[:, -1:]], axis=1
+    )
+
+    # Build interpolant on 25 Hz time axis (in units of 100 Hz samples).
+    ts_in = np.arange(fingers_25hz.shape[1]) * upscale_ratio
+    funcs = [interp1d(ts_in, fingers_25hz[ch], kind=interp_kind)
+             for ch in range(fingers_25hz.shape[0])]
+
+    # Evaluate at every 100 Hz sample, dropping the trailing duplicate region.
+    n_out = (fingers_25hz.shape[1] - 1) * upscale_ratio
+    ts_out = np.arange(n_out)
+
+    out = np.array([f(ts_out) for f in funcs], dtype=np.float64)
     return out
 
 
-# --------------------------------------------------------------------------- #
-# Scalers — fit on train only
-# --------------------------------------------------------------------------- #
+# ============================================================================
+# Step 6: time delay
+# ============================================================================
 
-@dataclass
-class RobustScaler1D:
-    q_low: float = 0.1
-    q_high: float = 0.9
-    median_: np.ndarray = None
-    low_: np.ndarray = None
-    high_: np.ndarray = None
-    scale_: np.ndarray = None
-
-    def fit(self, x: np.ndarray):
-        self.median_ = np.median(x, axis=-1, keepdims=True)
-        self.low_ = np.quantile(x, self.q_low, axis=-1, keepdims=True)
-        self.high_ = np.quantile(x, self.q_high, axis=-1, keepdims=True)
-        self.scale_ = self.high_ - self.low_ + 1e-8
-        return self
-
-    def transform(self, x: np.ndarray) -> np.ndarray:
-        x = np.clip(x, self.low_, self.high_)
-        return ((x - self.median_) / self.scale_).astype(np.float32)
-
-
-@dataclass
-class MinMaxScaler1D:
-    min_: np.ndarray = None
-    max_: np.ndarray = None
-
-    def fit(self, x: np.ndarray):
-        self.min_ = x.min(axis=-1, keepdims=True)
-        self.max_ = x.max(axis=-1, keepdims=True)
-        return self
-
-    def transform(self, x: np.ndarray) -> np.ndarray:
-        return ((x - self.min_) / (self.max_ - self.min_ + 1e-8)).astype(np.float32)
-
-
-# --------------------------------------------------------------------------- #
-# End-to-end pipeline
-# --------------------------------------------------------------------------- #
-
-def run_preprocessing_from_arrays(
-    ecog: np.ndarray,
+def crop_for_time_delay(
     fingers: np.ndarray,
+    spec: np.ndarray,
+    delay_s: float,
     sfreq: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Drop first `delay_s` of fingers and last `delay_s` of spectrograms,
+    so that spec[t] predicts fingers[t + delay].
+
+    FingerFlex uses delay_s = 0.2 in their CODE, despite the paper text
+    saying 20 ms. Code wins.
+    """
+    delay = int(round(delay_s * sfreq))
+    if delay <= 0:
+        return fingers, spec
+    return fingers[..., delay:], spec[..., : spec.shape[-1] - delay]
+
+
+# ============================================================================
+# Step 7: finger MinMax scaling (fit on train, applied to both)
+# ============================================================================
+
+class MinMaxScalerFingers:
+    """sklearn-style MinMaxScaler fitting on (5, T) finger arrays.
+
+    fit() takes shape (5, T_train); transform() handles either (5, T) or
+    (5, T) — basically transforms each finger by its train-fitted min/max.
+    Output is float32.
+    """
+    def __init__(self):
+        self.min_: np.ndarray | None = None
+        self.max_: np.ndarray | None = None
+
+    def fit(self, fingers: np.ndarray) -> "MinMaxScalerFingers":
+        self.min_ = fingers.min(axis=-1, keepdims=True)
+        self.max_ = fingers.max(axis=-1, keepdims=True)
+        return self
+
+    def transform(self, fingers: np.ndarray) -> np.ndarray:
+        return ((fingers - self.min_) /
+                (self.max_ - self.min_ + 1e-12)).astype(np.float32)
+
+
+# ============================================================================
+# End-to-end: process train+test together
+# ============================================================================
+
+def preprocess_train_test(
+    ecog_train: np.ndarray,
+    fingers_train: np.ndarray,
+    ecog_test: np.ndarray,
+    fingers_test: np.ndarray,
+    sfreq: float = 1000.0,
+    line_freq: float = 60.0,
     n_wavelets: int = 40,
     target_sfreq: float = 100.0,
-    delay_ms: float = 20.0,
-    train_frac: float = 0.65,
-    line_freq: float = 60.0,
+    delay_s: float = 0.2,
     verbose: bool = True,
 ) -> dict:
-    """Run the full preprocessing pipeline on already-loaded arrays.
+    """Run the full FingerFlex pipeline on already-split train and test.
 
-    The experiment runner calls this on chip-simulated ECoG streams. The CLI
-    `main()` calls it on the raw dataset.
+    Returns:
+      {
+        'features_train': (62, 40, T_train) float32,
+        'fingers_train':  (5, T_train) float32, MinMax scaled,
+        'features_test':  (62, 40, T_test) float32,
+        'fingers_test':   (5, T_test) float32, MinMax scaled,
+        'sfreq': 100.0,
+        'finger_scaler': MinMaxScalerFingers (fit on train),
+      }
 
-    Returns a dict with features, fingers, scalers, train split index, etc.
+    The two streams are processed separately (filtering, CAR, wavelets,
+    decimation) so there's no leakage between train and test through the
+    filter state. Finger scaler is fit on train only.
     """
+    def _process_ecog(x, label):
+        if verbose:
+            print(f"  [{label}] standardize + CAR…")
+        x = normalize_with_car(x)
+        if verbose:
+            print(f"  [{label}] bandpass + notch (line={line_freq}Hz)…")
+        x = filter_ecog_mne(x, sfreq=sfreq, line_freq=line_freq)
+        if verbose:
+            print(f"  [{label}] Morlet ({n_wavelets} wavelets)…")
+        spec = compute_spectrogramms_mne(
+            x, sfreq=sfreq, n_wavelets=n_wavelets,
+        )
+        if verbose:
+            print(f"  [{label}] decimate {sfreq:.0f} → {target_sfreq:.0f} Hz…")
+        spec = downsample_spectrogramms(spec, sfreq, target_sfreq)
+        return spec
+
+    # Process ECoG.
+    spec_train = _process_ecog(ecog_train, "train")
+    spec_test = _process_ecog(ecog_test, "test")
+
+    # Process fingers — interpolate to target_sfreq.
     if verbose:
-        print(f"  [preprocess] ECoG: {ecog.shape}, fs={sfreq}")
-
-    if verbose: print("  [preprocess] filtering (bandpass + notch)…")
-    ecog = preprocess_ecog_raw(ecog, sfreq, line_freq=line_freq)
-
-    if verbose: print(f"  [preprocess] building {n_wavelets} Morlet wavelets…")
-    freqs, kernels = make_morlet_bank(sfreq, n_wavelets=n_wavelets)
-
-    if verbose: print("  [preprocess] convolving (slow step)…")
-    feats_full = convolve_morlet_bank(ecog, kernels, verbose=verbose)
-    if verbose: print(f"    shape: {feats_full.shape}")
-
-    if verbose: print(f"  [preprocess] decimating {sfreq:.0f} → {target_sfreq:.0f} Hz…")
-    decim = int(sfreq // target_sfreq)
-    feats = decimate(feats_full, decim, axis=-1, ftype="iir").astype(np.float32)
-    del feats_full
-
-    if verbose: print("  [preprocess] interpolating fingers…")
-    fingers_clean = fill_nan_by_interpolation(fingers)
-    fingers_resamp = upsample_fingers_bicubic(fingers_clean, sfreq, target_sfreq)
+        print("  [fingers] cubic interpolation 1kHz → 100Hz…")
+    fings_train_interp = interpolate_fingers(
+        fingers_train, sfreq_in=sfreq, target_sfreq=target_sfreq,
+    )
+    fings_test_interp = interpolate_fingers(
+        fingers_test, sfreq_in=sfreq, target_sfreq=target_sfreq,
+    )
 
     # Align lengths.
-    T_min = min(feats.shape[-1], fingers_resamp.shape[-1])
-    feats = feats[..., :T_min]
-    fingers_resamp = fingers_resamp[..., :T_min]
+    T_train = min(spec_train.shape[-1], fings_train_interp.shape[-1])
+    T_test  = min(spec_test.shape[-1],  fings_test_interp.shape[-1])
+    spec_train = spec_train[..., :T_train]
+    spec_test  = spec_test[..., :T_test]
+    fings_train_interp = fings_train_interp[..., :T_train]
+    fings_test_interp  = fings_test_interp[..., :T_test]
 
-    if verbose: print(f"  [preprocess] applying {delay_ms:.0f}ms ECoG-fingers shift…")
-    delay = int(round(delay_ms * target_sfreq / 1000.0))
-    if delay > 0:
-        feats = feats[..., :-delay]
-        fingers_resamp = fingers_resamp[..., delay:]
+    # Apply 200ms time delay.
+    if verbose:
+        print(f"  [delay] applying {delay_s*1000:.0f} ms ECoG-fingers shift…")
+    fings_train_interp, spec_train = crop_for_time_delay(
+        fings_train_interp, spec_train, delay_s, target_sfreq,
+    )
+    fings_test_interp, spec_test = crop_for_time_delay(
+        fings_test_interp, spec_test, delay_s, target_sfreq,
+    )
 
-    n_total = feats.shape[-1]
-    n_train = int(n_total * train_frac)
-
-    if verbose: print("  [preprocess] fitting scalers on train split…")
-    fs = RobustScaler1D().fit(feats[..., :n_train])
-    ms = MinMaxScaler1D().fit(fingers_resamp[..., :n_train])
+    # MinMax scale fingers (fit on train).
+    if verbose:
+        print("  [fingers] MinMax scale (fit on train)…")
+    scaler = MinMaxScalerFingers().fit(fings_train_interp)
+    fings_train_scaled = scaler.transform(fings_train_interp)
+    fings_test_scaled  = scaler.transform(fings_test_interp)
 
     return {
-        "features": fs.transform(feats),
-        "fingers": ms.transform(fingers_resamp),
+        "features_train": spec_train,
+        "fingers_train":  fings_train_scaled,
+        "features_test":  spec_test,
+        "fingers_test":   fings_test_scaled,
         "sfreq": target_sfreq,
-        "n_train": n_train,
-        "feat_scaler": fs,
-        "finger_scaler": ms,
-        "wavelet_freqs": freqs,
+        "finger_scaler": scaler,
     }
 
 
-def main():
-    """CLI: preprocess the raw dataset (no chip simulation) and save."""
-    from braindecode.datasets import BCICompetitionIVDataset4
-
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--subject", type=int, default=1)
-    ap.add_argument("--out-dir", type=str, default="./preprocessed")
-    ap.add_argument("--line-freq", type=float, default=60.0)
-    args = ap.parse_args()
-
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"Loading subject {args.subject}…")
-    ds = BCICompetitionIVDataset4(subject_ids=[args.subject])
-    raw = ds.datasets[0].raw
-    data = raw.get_data()
-    sfreq = float(raw.info["sfreq"])
-    assert sfreq == 1000.0
-    ecog, fingers = data[:62], data[62:67]
-
-    out = run_preprocessing_from_arrays(
-        ecog, fingers, sfreq, line_freq=args.line_freq
-    )
-    out["subject_id"] = args.subject
-
-    path = out_dir / f"subject_{args.subject}.pkl"
-    with open(path, "wb") as f:
-        pickle.dump(out, f)
-    print(f"Saved {path}")
-    print(f"  features: {out['features'].shape}  fingers: {out['fingers'].shape}")
-    print(f"  n_train: {out['n_train']}  n_val: {out['features'].shape[-1] - out['n_train']}")
-
-
 if __name__ == "__main__":
-    main()
+    # Smoke test the pipeline shapes on synthetic data.
+    sfreq = 1000.0
+    rng = np.random.default_rng(0)
+    e_tr = rng.standard_normal((62, 10000))
+    f_tr = rng.standard_normal((5, 10000))
+    e_te = rng.standard_normal((62, 5000))
+    f_te = rng.standard_normal((5, 5000))
+    out = preprocess_train_test(
+        e_tr, f_tr, e_te, f_te, sfreq=sfreq, verbose=True,
+    )
+    print()
+    print(f"features_train: {out['features_train'].shape}")
+    print(f"fingers_train:  {out['fingers_train'].shape}")
+    print(f"features_test:  {out['features_test'].shape}")
+    print(f"fingers_test:   {out['fingers_test'].shape}")
+    assert out['features_train'].shape[-1] == out['fingers_train'].shape[-1]
+    assert out['features_test'].shape[-1] == out['fingers_test'].shape[-1]
+    print("OK")
