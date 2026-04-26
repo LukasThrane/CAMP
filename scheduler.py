@@ -204,11 +204,142 @@ class CAMPScheduler(_BaseScheduler):
         self._deficit[:] = 0.0
 
 
+class StaticSaliencyScheduler(_BaseScheduler):
+    """DRR with FIXED weights from offline saliency analysis.
+
+    Same DRR mechanics as CAMPScheduler, but the weight vector is
+    constant — set once at instantiation from a saliency NPZ — and never
+    updates. This is the Neuralite-equivalent baseline: channel selection
+    determined offline by analyzing the trained decoder.
+
+    The floor mechanism still applies, so even very-low-saliency channels
+    transmit occasionally. This prevents brittleness if the saliency
+    estimate misses a channel that turns out to matter.
+    """
+
+    def __init__(self, n_channels, bandwidth_frac, saliency_weights,
+                 floor_frac=0.1):
+        super().__init__(n_channels, bandwidth_frac)
+        assert 0.0 <= floor_frac <= 1.0
+        assert saliency_weights.shape == (n_channels,), \
+            f"expected ({n_channels},), got {saliency_weights.shape}"
+        # Normalize defensively in case saliency vector doesn't quite sum to 1.
+        s = saliency_weights.sum()
+        self.weights = (saliency_weights / s if s > 0
+                        else np.full(n_channels, 1.0 / n_channels))
+        self.floor_frac = floor_frac
+        self._deficit = np.zeros(n_channels)
+        self._floor_quota = floor_frac * (self.K / n_channels)
+
+    def select(self, _ignored_weights):
+        # Use our static saliency weights regardless of what's passed in.
+        # OnChipPredictor still runs upstream (we don't disable it) but its
+        # output is ignored here.
+        self._deficit += self.weights * self.K
+
+        forced = self._deficit >= (1.0 + self._floor_quota)
+        n_forced = int(forced.sum())
+
+        sel = np.zeros(self.n_channels, dtype=bool)
+        if n_forced >= self.K:
+            top_forced = np.argpartition(-self._deficit, self.K - 1)[: self.K]
+            sel[top_forced] = True
+        else:
+            sel[forced] = True
+            remaining = self.K - n_forced
+            if remaining > 0:
+                cand = np.where(sel, -np.inf, self.weights)
+                top_w = np.argpartition(-cand, remaining - 1)[:remaining]
+                sel[top_w] = True
+
+        self._deficit[sel] -= 1.0
+        return sel
+
+    def reset(self):
+        self._deficit[:] = 0.0
+
+
+class HybridScheduler(_BaseScheduler):
+    """DRR with weights = saliency × activity, normalized.
+
+    The on-chip predictor still produces dynamic activity weights based on
+    beta desync. We multiply those by the offline saliency prior — favoring
+    channels that are BOTH decoder-relevant AND currently active. A channel
+    that's active but not decoder-relevant gets suppressed; a channel that's
+    decoder-relevant but quiescent gets some bandwidth but less than during
+    a flexion burst.
+
+    This is the proposal's hybrid, with the offline saliency prior playing
+    the role of the proposal's runtime server-side correction.
+    """
+
+    def __init__(self, n_channels, bandwidth_frac, saliency_weights,
+                 floor_frac=0.1):
+        super().__init__(n_channels, bandwidth_frac)
+        assert 0.0 <= floor_frac <= 1.0
+        assert saliency_weights.shape == (n_channels,)
+        s = saliency_weights.sum()
+        self.saliency = (saliency_weights / s if s > 0
+                         else np.full(n_channels, 1.0 / n_channels))
+        self.floor_frac = floor_frac
+        self._deficit = np.zeros(n_channels)
+        self._floor_quota = floor_frac * (self.K / n_channels)
+
+    def select(self, activity_weights):
+        # Element-wise multiply, then renormalize.
+        combined = self.saliency * activity_weights
+        total = combined.sum()
+        if total > 0:
+            combined = combined / total
+        else:
+            # Fall back to saliency only if activity is all zero.
+            combined = self.saliency.copy()
+
+        self._deficit += combined * self.K
+
+        forced = self._deficit >= (1.0 + self._floor_quota)
+        n_forced = int(forced.sum())
+
+        sel = np.zeros(self.n_channels, dtype=bool)
+        if n_forced >= self.K:
+            top_forced = np.argpartition(-self._deficit, self.K - 1)[: self.K]
+            sel[top_forced] = True
+        else:
+            sel[forced] = True
+            remaining = self.K - n_forced
+            if remaining > 0:
+                cand = np.where(sel, -np.inf, combined)
+                top_w = np.argpartition(-cand, remaining - 1)[:remaining]
+                sel[top_w] = True
+
+        self._deficit[sel] -= 1.0
+        return sel
+
+    def reset(self):
+        self._deficit[:] = 0.0
+
+
 def make_scheduler(strategy: str, n_channels: int, bandwidth_frac: float,
-                   floor_frac: float = 0.1) -> _BaseScheduler:
-    if strategy == "full":        return FullResolutionScheduler(n_channels, bandwidth_frac)
-    if strategy == "round_robin": return RoundRobinScheduler(n_channels, bandwidth_frac)
-    if strategy == "camp":        return CAMPScheduler(n_channels, bandwidth_frac, floor_frac)
+                   floor_frac: float = 0.1,
+                   saliency_weights: np.ndarray | None = None) -> _BaseScheduler:
+    if strategy == "full":
+        return FullResolutionScheduler(n_channels, bandwidth_frac)
+    if strategy == "round_robin":
+        return RoundRobinScheduler(n_channels, bandwidth_frac)
+    if strategy == "camp":
+        return CAMPScheduler(n_channels, bandwidth_frac, floor_frac)
+    if strategy == "static_saliency":
+        if saliency_weights is None:
+            raise ValueError("static_saliency strategy requires saliency_weights")
+        return StaticSaliencyScheduler(
+            n_channels, bandwidth_frac, saliency_weights, floor_frac,
+        )
+    if strategy == "hybrid":
+        if saliency_weights is None:
+            raise ValueError("hybrid strategy requires saliency_weights")
+        return HybridScheduler(
+            n_channels, bandwidth_frac, saliency_weights, floor_frac,
+        )
     raise ValueError(f"unknown strategy: {strategy!r}")
 
 
@@ -257,6 +388,7 @@ class ChipSimulator:
         floor_frac: float = 0.1,
         chunk_size: int = 30,
         update_period_s: float = 0.010,
+        saliency_weights: np.ndarray | None = None,
     ):
         self.n_channels = n_channels
         self.sfreq = sfreq
@@ -267,6 +399,7 @@ class ChipSimulator:
         )
         self.scheduler = make_scheduler(
             strategy, n_channels, bandwidth_frac, floor_frac,
+            saliency_weights=saliency_weights,
         )
         self.sah = SampleAndHold(n_channels)
 

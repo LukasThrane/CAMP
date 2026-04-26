@@ -66,6 +66,7 @@ def simulate_chip(
     strategy: str,
     bandwidth_frac: float,
     floor_frac: float,
+    saliency_weights: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Run the chip simulator separately on train and test ECoG.
 
@@ -81,12 +82,14 @@ def simulate_chip(
     chip_tr = ChipSimulator(
         n_channels=ecog_train.shape[0], sfreq=sfreq,
         strategy=strategy, bandwidth_frac=bandwidth_frac, floor_frac=floor_frac,
+        saliency_weights=saliency_weights,
     )
     chip_train = chip_tr.process(ecog_train)
 
     chip_te = ChipSimulator(
         n_channels=ecog_test.shape[0], sfreq=sfreq,
         strategy=strategy, bandwidth_frac=bandwidth_frac, floor_frac=floor_frac,
+        saliency_weights=saliency_weights,
     )
     chip_test = chip_te.process(ecog_test)
     return chip_train, chip_test
@@ -107,6 +110,7 @@ def cell_paradigm_b(
     floor_frac: float,
     line_freq: float,
     ckpt_dir: Path,
+    saliency_weights: np.ndarray | None = None,
 ) -> dict:
     """Train a fresh decoder on chip-output train, eval on chip-output test."""
     print(f"\n{'=' * 60}")
@@ -118,6 +122,7 @@ def cell_paradigm_b(
     chip_train, chip_test = simulate_chip(
         split["ecog_train"], split["ecog_test"], sfreq,
         strategy, bandwidth_frac, floor_frac,
+        saliency_weights=saliency_weights,
     )
     fings_tr = split["fingers_train"][:, :chip_train.shape[1]]
     fings_te = split["fingers_test"][:,  :chip_test.shape[1]]
@@ -236,6 +241,7 @@ def eval_paradigm_a_cell(
     line_freq: float,
     floor_frac: float,
     device: str,
+    saliency_weights: np.ndarray | None = None,
 ) -> dict:
     """Evaluate the pre-trained full-res decoder on (strategy, B) chip output.
 
@@ -250,6 +256,7 @@ def eval_paradigm_a_cell(
     chip_train, chip_test = simulate_chip(
         split["ecog_train"], split["ecog_test"], sfreq,
         strategy, bandwidth_frac, floor_frac,
+        saliency_weights=saliency_weights,
     )
     fings_tr = split["fingers_train"][:, :chip_train.shape[1]]
     fings_te = split["fingers_test"][:,  :chip_test.shape[1]]
@@ -333,6 +340,32 @@ def run_grid(args) -> list[dict]:
 
     split = load_subject_split(args.subject, cache_dir=cache_dir)
 
+    # Load saliency vector if provided. Required if static_saliency or hybrid
+    # are in the strategy list.
+    saliency_weights = None
+    if args.saliency_path is not None:
+        sal_path = Path(args.saliency_path)
+        if not sal_path.exists():
+            raise FileNotFoundError(f"saliency file not found: {sal_path}")
+        sal_data = np.load(sal_path)
+        saliency_weights = sal_data["saliency"].astype(np.float64)
+        print(f"[saliency] loaded {sal_path.name}, "
+              f"shape={saliency_weights.shape}, "
+              f"sum={saliency_weights.sum():.4f}")
+        # Sanity check: should sum to ~1.
+        if not np.isclose(saliency_weights.sum(), 1.0, atol=0.01):
+            print(f"  warning: saliency sum is {saliency_weights.sum():.4f}, "
+                  "renormalizing.")
+            saliency_weights = saliency_weights / saliency_weights.sum()
+
+    needs_saliency = any(
+        s in ("static_saliency", "hybrid") for s in args.strategies
+    )
+    if needs_saliency and saliency_weights is None:
+        raise ValueError(
+            "static_saliency and hybrid strategies require --saliency-path"
+        )
+
     grid_path = out_dir / "grid.json"
     results: list[dict] = []
     done_keys: set = set()
@@ -392,6 +425,7 @@ def run_grid(args) -> list[dict]:
                         line_freq=args.line_freq,
                         floor_frac=args.floor_frac,
                         device=args.device,
+                        saliency_weights=saliency_weights,
                     )
                     results.append(r)
                 except Exception as e:
@@ -418,6 +452,7 @@ def run_grid(args) -> list[dict]:
                         floor_frac=args.floor_frac,
                         line_freq=args.line_freq,
                         ckpt_dir=ckpt_dir,
+                        saliency_weights=saliency_weights,
                     )
                     results.append(r)
                 except Exception as e:
@@ -478,8 +513,14 @@ def plot_grid(
         squeeze=False,
     )
 
-    markers = {"full": "s", "round_robin": "o", "camp": "^"}
-    colors  = {"full": "tab:gray", "round_robin": "tab:red", "camp": "tab:blue"}
+    markers = {
+        "full": "s", "round_robin": "o", "camp": "^",
+        "static_saliency": "D", "hybrid": "*",
+    }
+    colors  = {
+        "full": "tab:gray", "round_robin": "tab:red", "camp": "tab:blue",
+        "static_saliency": "tab:green", "hybrid": "tab:purple",
+    }
 
     for ax_i, p in enumerate(paradigms_present):
         ax = axes[0, ax_i]
@@ -542,6 +583,11 @@ def main():
     ap.add_argument("--out-dir", type=str, default="./results")
     ap.add_argument("--cache-dir", type=str, default="./cache")
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument(
+        "--saliency-path", type=str, default=None,
+        help="Path to saliency NPZ from saliency.py. Required if "
+             "static_saliency or hybrid in --strategies.",
+    )
     args = ap.parse_args()
 
     print(f"Paradigm:   {args.paradigm}")
