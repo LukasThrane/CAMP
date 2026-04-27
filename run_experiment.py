@@ -359,11 +359,12 @@ def run_grid(args) -> list[dict]:
             saliency_weights = saliency_weights / saliency_weights.sum()
 
     needs_saliency = any(
-        s in ("static_saliency", "hybrid") for s in args.strategies
+        s in ("camp_saliency", "camp_hybrid_beta", "camp_hybrid_gamma")
+        for s in args.strategies
     )
     if needs_saliency and saliency_weights is None:
         raise ValueError(
-            "static_saliency and hybrid strategies require --saliency-path"
+            "camp_saliency / camp_hybrid_* strategies require --saliency-path"
         )
 
     grid_path = out_dir / "grid.json"
@@ -514,12 +515,22 @@ def plot_grid(
     )
 
     markers = {
-        "full": "s", "round_robin": "o", "camp": "^",
-        "static_saliency": "D", "hybrid": "*",
+        "full": "s",
+        "round_robin": "o",
+        "camp_beta": "^",
+        "camp_gamma": "v",
+        "camp_saliency": "D",
+        "camp_hybrid_beta": "*",
+        "camp_hybrid_gamma": "P",
     }
     colors  = {
-        "full": "tab:gray", "round_robin": "tab:red", "camp": "tab:blue",
-        "static_saliency": "tab:green", "hybrid": "tab:purple",
+        "full": "tab:gray",
+        "round_robin": "tab:red",
+        "camp_beta": "tab:blue",
+        "camp_gamma": "tab:cyan",
+        "camp_saliency": "tab:green",
+        "camp_hybrid_beta": "tab:purple",
+        "camp_hybrid_gamma": "tab:orange",
     }
 
     for ax_i, p in enumerate(paradigms_present):
@@ -571,8 +582,15 @@ def main():
         "--paradigm", choices=["A", "B", "both"], default="B",
         help="A=train-once-on-full, B=co-train-per-cell, both=run both."
     )
-    ap.add_argument("--strategies", nargs="+",
-                    default=["full", "round_robin", "camp"])
+    ap.add_argument(
+        "--strategies", nargs="+",
+        default=["full", "round_robin", "camp_beta"],
+        help="Choose from: full, round_robin, camp_beta, camp_gamma, "
+             "camp_saliency, camp_hybrid_beta, camp_hybrid_gamma. "
+             "All 'camp_*' strategies share the CAMP framework "
+             "(predictor → DRR → sample-and-hold); they differ only in "
+             "which predictor produces the channel weights.",
+    )
     ap.add_argument("--bandwidths", nargs="+", type=float,
                     default=[1.0, 0.9, 0.5, 0.2, 0.1])
     ap.add_argument("--epochs", type=int, default=30)
@@ -586,7 +604,7 @@ def main():
     ap.add_argument(
         "--saliency-path", type=str, default=None,
         help="Path to saliency NPZ from saliency.py. Required if "
-             "static_saliency or hybrid in --strategies.",
+             "camp_saliency or camp_hybrid_* in --strategies.",
     )
     args = ap.parse_args()
 

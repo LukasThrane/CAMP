@@ -322,25 +322,53 @@ class HybridScheduler(_BaseScheduler):
 def make_scheduler(strategy: str, n_channels: int, bandwidth_frac: float,
                    floor_frac: float = 0.1,
                    saliency_weights: np.ndarray | None = None) -> _BaseScheduler:
+    """Strategy → scheduler. The strategy name encodes both the scheduler
+    class and (where applicable) the predictor band, but the band itself is
+    consumed by the ChipSimulator's OnChipPredictor, not by the scheduler.
+
+    Strategies:
+      'full'              — transmit every channel every chunk
+      'round_robin'       — cyclic, ignores predictor weights
+      'camp_beta'         — DRR top-K with beta-desync activity predictor
+      'camp_gamma'        — DRR top-K with high-gamma activity predictor
+      'camp_saliency'     — DRR top-K with FIXED offline saliency weights
+                            (predictor still runs but its output is ignored)
+      'camp_hybrid_beta'  — DRR top-K with saliency × beta-activity
+      'camp_hybrid_gamma' — DRR top-K with saliency × gamma-activity
+    """
     if strategy == "full":
         return FullResolutionScheduler(n_channels, bandwidth_frac)
     if strategy == "round_robin":
         return RoundRobinScheduler(n_channels, bandwidth_frac)
-    if strategy == "camp":
+    if strategy in ("camp_beta", "camp_gamma"):
+        # Same scheduler class — the difference is which band the
+        # ChipSimulator's predictor is configured with.
         return CAMPScheduler(n_channels, bandwidth_frac, floor_frac)
-    if strategy == "static_saliency":
+    if strategy == "camp_saliency":
         if saliency_weights is None:
-            raise ValueError("static_saliency strategy requires saliency_weights")
+            raise ValueError(f"{strategy} requires saliency_weights")
         return StaticSaliencyScheduler(
             n_channels, bandwidth_frac, saliency_weights, floor_frac,
         )
-    if strategy == "hybrid":
+    if strategy in ("camp_hybrid_beta", "camp_hybrid_gamma"):
         if saliency_weights is None:
-            raise ValueError("hybrid strategy requires saliency_weights")
+            raise ValueError(f"{strategy} requires saliency_weights")
         return HybridScheduler(
             n_channels, bandwidth_frac, saliency_weights, floor_frac,
         )
     raise ValueError(f"unknown strategy: {strategy!r}")
+
+
+def band_for_strategy(strategy: str) -> "BandSpec":
+    """Return the band the on-chip predictor should run for this strategy.
+
+    Even strategies that don't *use* the predictor's output (full,
+    round_robin, camp_saliency) still get one — it's harmless and keeps
+    the chip wiring uniform. We pick BAND_MOTOR (beta) as a no-op default.
+    """
+    if strategy in ("camp_gamma", "camp_hybrid_gamma"):
+        return BAND_VISUAL   # high-gamma 70-150 Hz
+    return BAND_MOTOR        # beta 13-30 Hz (or no-op for non-beta strategies)
 
 
 # ============================================================================
@@ -384,7 +412,7 @@ class ChipSimulator:
         sfreq: float,
         strategy: str,
         bandwidth_frac: float,
-        band: BandSpec = BAND_MOTOR,
+        band: BandSpec | None = None,
         floor_frac: float = 0.1,
         chunk_size: int = 30,
         update_period_s: float = 0.010,
@@ -393,6 +421,12 @@ class ChipSimulator:
         self.n_channels = n_channels
         self.sfreq = sfreq
         self.chunk_size = chunk_size
+        # If the caller doesn't override, pick the band based on strategy.
+        # camp_gamma / camp_hybrid_gamma need the high-gamma band; everything
+        # else defaults to beta (which is a no-op for non-CAMP strategies).
+        if band is None:
+            band = band_for_strategy(strategy)
+        self.band = band
         self.predictor = OnChipPredictor(
             n_channels=n_channels, sfreq=sfreq, band=band,
             update_period_s=update_period_s,
@@ -445,7 +479,7 @@ if __name__ == "__main__":
         signal[c] += envelope * np.sin(2 * np.pi * 20.0 * t)
 
     chip = ChipSimulator(
-        n_channels=C, sfreq=sfreq, strategy="camp",
+        n_channels=C, sfreq=sfreq, strategy="camp_beta",
         bandwidth_frac=0.2, floor_frac=0.1, chunk_size=T_chunk,
     )
     selections = np.zeros(C, dtype=np.int64)
