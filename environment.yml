@@ -1,0 +1,23 @@
+name: camp
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - scikit-learn
+  - mne
+  - braindecode
+  - moabb
+  - pytorch
+  - torchvision
+  - torchaudio
+  # GPU (optional): after `conda env create -f environment.yml`, run:
+  #   conda install -n camp pytorch-cuda=12.1 -c nvidia
+  # Adjust CUDA version to your driver/toolkit.
+
